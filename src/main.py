@@ -220,6 +220,9 @@ class CoursePoint(UserDict):
     def message_index(self, message_index):
         self.data['message_index'] = message_index
 
+    def __str__(self):
+        return f'{{\'name\': \'{self.data['name']}\', \'distance\': {self.data['distance'] / 1000:.2f}, \'position_lat\': {self.data['position_lat']}, \'position_long\': \'{self.data['position_long']}\', \'timestamp\': \'{self.data['timestamp']}\', \'message_index\': {self.data['message_index']}}}'
+
 def degrees2semicircle(degrees):
     # Convert degrees to semicircle representation(180 * 2^31)
     return gpxpy.geo.Location(
@@ -262,32 +265,75 @@ def cal_distance_Hubeny(point1, point2):
     distance = math.sqrt((M * dphi)**2 + (N * math.cos(mean_phi) * dlam)**2)
     return distance
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description='Convert GPX to FIT Course file.',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+def makefit(course_name: str, records: list[Record], course_points: list[CoursePoint], speed: float):
+    '''
+    https://developer.garmin.com/fit/cookbook/encoding-course-files/
+    Sequencing Course File Messages
+    There is an expected message sequence for Course files that should be strictly adhered to. The first message in the file should be a File Id message with the file type set to 6 (Course). The second message in the file is a single Course message with the name and optional sport & sub sport types. A Lap message is required for all Course files and provides additional summary information about the course, including the starting position and overall distance of the course. Record messages are written to the file in chronological ascending order so no message_index is required. The optional Course Point messages provide information about Points Of Interest along the course.
+
+    The sequence of messages for a Course file is:
+
+    File Id [1]
+    Course [1]
+    Lap [1…n]
+    Event Timer Start
+    Record [1…n]
+    Course Point [0…n]
+    Event Timer Stop
+    The optional Course Point messages can be grouped together after the Record messages or interleaved with the Record message by timestamp.
+
+    '''
+
+    encoder = Encoder()
+    file_id = FileID(
+        manufacturer='development',
+        product=1,
+        time_created=datetime.datetime.now(tz=datetime.timezone.utc),
+        type='course',
     )
+    encoder.on_mesg(Profile['mesg_num']['FILE_ID'], file_id.data)
 
-    parser.add_argument('src_file', metavar='src_file',
-                        help='The source file name(s). JPGIS(GML) DEM zip/xml files.')
-    parser.add_argument('-s', '--speed', dest='speed', type=float, default=25.0,
-                        help='Speed in km/h (default: 25.0)')
+    course = Course(
+        name=course_name,
+        sport=2,
+        sub_sport=7
+    )
+    encoder.on_mesg(Profile['mesg_num']['COURSE'], course.data)
 
-    args = parser.parse_args(argv[1:] if argv else None)
-    fname = args.src_file
+    laps = Lap(records=records, speed=speed)
+    encoder.on_mesg(Profile['mesg_num']['LAP'], laps.data)
 
-    with open(f'./{fname}', 'r') as gpx_file:
+    event_start = EventTimerStart(timestamp=records[0].timestamp)
+    encoder.on_mesg(Profile['mesg_num']['EVENT'], event_start.data)
+
+    for record in records:
+        encoder.on_mesg(Profile['mesg_num']['RECORD'], record)
+
+    for counter, course_point in enumerate(course_points):
+        course_point.type = 'generic'
+        course_point.message_index = counter
+        print(f'course_point: {course_point}')
+        encoder.on_mesg(Profile['mesg_num']['COURSE_POINT'], course_point.data)
+
+    event_stop = EventTimerStop(timestamp=records[-1].timestamp)
+    encoder.on_mesg(Profile['mesg_num']['EVENT'], event_stop.data)
+
+    uint8_array = encoder.close()
+    return uint8_array
+
+def gpx2fit(src_file, speed=25.0):
+
+    with open(src_file, 'r') as gpx_file:
         gpx = gpxpy.parse(gpx_file)
 
         print(f'GPX time: {gpx.time}')
         print(f'GPX name: {gpx.name}')
         print(f'track name: {gpx.tracks[0].name}')
 
-        speed = round(args.speed / (60**2 / 1000), ndigits=3) # km/h -> m/s
+        speed_ms = round(speed / (60**2 / 1000), ndigits=3) # km/h -> m/s
 
         distance: float = 0.
         records: list[Record] = []
-
         for track in gpx.tracks:
             for segment in track.segments:
                 point_prev = None
@@ -299,8 +345,8 @@ def main(argv=None):
 
                     record = Record(
                         position=point_semicircle,
-                        timestamp=gpx.time + datetime.timedelta(seconds=round(distance / speed)),
-                        speed=speed,
+                        timestamp=gpx.time + datetime.timedelta(seconds=round(distance / speed_ms)),
+                        speed=speed_ms,
                         distance=distance,
                         position_deg=point,
                     )
@@ -318,60 +364,26 @@ def main(argv=None):
                 if min_dist <= COURSE_POINT_MIN_DISTANCE:
                     course_points.append(CoursePoint(record=records[nearest_counter], name=waypoint.name))
 
-            '''
-            https://developer.garmin.com/fit/cookbook/encoding-course-files/
-            Sequencing Course File Messages
-            There is an expected message sequence for Course files that should be strictly adhered to. The first message in the file should be a File Id message with the file type set to 6 (Course). The second message in the file is a single Course message with the name and optional sport & sub sport types. A Lap message is required for all Course files and provides additional summary information about the course, including the starting position and overall distance of the course. Record messages are written to the file in chronological ascending order so no message_index is required. The optional Course Point messages provide information about Points Of Interest along the course.
-
-            The sequence of messages for a Course file is:
-
-            File Id [1]
-            Course [1]
-            Lap [1…n]
-            Event Timer Start
-            Record [1…n]
-            Course Point [0…n]
-            Event Timer Stop
-            The optional Course Point messages can be grouped together after the Record messages or interleaved with the Record message by timestamp.
-
-            '''
-
-            encoder = Encoder()
-            file_id = FileID(
-                manufacturer='development',
-                product=1,
-                time_created=datetime.datetime.now(tz=datetime.timezone.utc),
-                type='course',
-            )
-            encoder.on_mesg(Profile['mesg_num']['FILE_ID'], file_id.data)
-
-            course = Course(
-                name=gpx.tracks[0].name,
-                sport=2,
-                sub_sport=7
-            )
-            encoder.on_mesg(Profile['mesg_num']['COURSE'], course.data)
-
-            laps = Lap(records=records, speed=speed)
-            encoder.on_mesg(Profile['mesg_num']['LAP'], laps.data)
-
-            event_start = EventTimerStart(timestamp=records[0].timestamp)
-            encoder.on_mesg(Profile['mesg_num']['EVENT'], event_start.data)
-
-            for record in records:
-                encoder.on_mesg(Profile['mesg_num']['RECORD'], record)
-
-            for counter, course_point in enumerate(course_points):
-                course_point.type = 'generic'
-                course_point.message_index = counter
-                encoder.on_mesg(Profile['mesg_num']['COURSE_POINT'], course_point.data)
-
-            event_stop = EventTimerStop(timestamp=records[-1].timestamp)
-            encoder.on_mesg(Profile['mesg_num']['EVENT'], event_stop.data)
-
-            uint8_array = encoder.close()
-            with open(f'{os.path.join('.', os.path.splitext(os.path.basename(fname))[0])}.fit', 'wb') as f:
+            uint8_array = makefit(course_name=track.name, records=records, course_points=course_points, speed=speed_ms)
+            with open(f'{os.path.join('.', os.path.splitext(os.path.basename(src_file))[0])}.fit', 'wb') as f:
                 f.write(uint8_array)
+        
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Convert GPX to FIT Course file.',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('src_file', metavar='src_file',
+                        help='The source file name(s). JPGIS(GML) DEM zip/xml files.')
+    parser.add_argument('-s', '--speed', dest='speed', type=float, default=25.0,
+                        help='Speed in km/h (default: 25.0)')
+
+    args = parser.parse_args(argv[1:] if argv else None)
+
+    gpx2fit(args.src_file, speed=args.speed)
+
+
 
 if __name__ == "__main__":
     try:
